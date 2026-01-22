@@ -4,8 +4,284 @@ Herramientas de base de datos para los agentes de OpenAI
 from typing import List, Dict, Any, Optional
 import structlog
 from app.core.database import db_manager
+from openai import OpenAI  # ← NUEVO
+from app.core.config import settings  # ← NUEVO
+import json  # ← NUEVO
+import time  # ← NUEVO
+import re  # ← NUEVO
 
 logger = structlog.get_logger()
+
+class SchemaIntelligenceAgent:
+    """
+    Agente que usa LLM para analizar schemas y determinar
+    campos importantes SIN reglas hardcodeadas
+    """
+    
+    def __init__(self):
+        self.client = OpenAI(api_key=settings.OPENAI_API_KEY)
+        self.db = db_manager
+        self.analysis_cache = {}
+    
+    async def analyze_table_importance(
+        self,
+        table_name: str,
+        sample_data: Optional[List[Dict]] = None,
+        force_refresh: bool = False
+    ) -> Dict[str, Any]:
+        """Usa el LLM para analizar qué campos son importantes"""
+        cache_key = f"importance_{table_name}"
+        
+        if not force_refresh and cache_key in self.analysis_cache:
+            logger.info("using_cached_schema_analysis", table=table_name)
+            return self.analysis_cache[cache_key]
+        
+        try:
+            schema = self.db.get_table_schema(table_name)
+            columns = schema.get("columns", [])
+            
+            if not columns:
+                return self._empty_analysis(table_name)
+            
+            if not sample_data:
+                sample_data = self.db.get_sample_data(table_name, limit=3)
+            
+            prompt = self._build_analysis_prompt(
+                table_name=table_name,
+                columns=columns,
+                sample_data=sample_data,
+                primary_key=schema.get("primary_key", []),
+                foreign_keys=schema.get("foreign_keys", [])
+            )
+            
+            logger.info("analyzing_schema_with_llm", table=table_name, fields=len(columns))
+            
+            response = self.client.chat.completions.create(
+                model=settings.OPENAI_MODEL,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "Eres un experto en bases de datos que analiza schemas para determinar qué campos son importantes para contexto conversacional."
+                    },
+                    {
+                        "role": "user",
+                        "content": prompt
+                    }
+                ],
+                temperature=0.1,
+                response_format={"type": "json_object"}
+            )
+            
+            analysis = json.loads(response.choices[0].message.content)
+            
+            result = self._validate_and_structure_analysis(
+                table_name=table_name,
+                analysis=analysis,
+                total_fields=len(columns)
+            )
+            
+            self.analysis_cache[cache_key] = result
+            
+            logger.info(
+                "schema_analyzed_by_llm",
+                table=table_name,
+                total_fields=len(columns),
+                essential_fields=len(result.get("essential_fields", [])),
+                reasoning=result.get("reasoning", "")[:100]
+            )
+            
+            return result
+            
+        except Exception as e:
+            logger.error("schema_intelligence_error", table=table_name, error=str(e))
+            return self._empty_analysis(table_name)
+    
+    def _build_analysis_prompt(
+        self,
+        table_name: str,
+        columns: List[Dict],
+        sample_data: List[Dict],
+        primary_key: List[str],
+        foreign_keys: List[Dict]
+    ) -> str:
+        """Construye prompt para que el LLM analice el schema"""
+        prompt = f"""Analiza esta tabla de base de datos y determina qué campos son MÁS IMPORTANTES para incluir en un contexto conversacional.
+
+TABLA: {table_name}
+TOTAL DE CAMPOS: {len(columns)}
+
+SCHEMA:
+"""
+        
+        for col in columns:
+            col_name = col["name"]
+            col_type = str(col["type"])
+            is_pk = "🔑 PRIMARY KEY" if col_name in primary_key else ""
+            
+            is_fk = ""
+            for fk in foreign_keys:
+                if col_name in fk.get("constrained_columns", []):
+                    ref_table = fk.get("referred_table", "")
+                    is_fk = f"🔗 FK → {ref_table}"
+                    break
+            
+            prompt += f"\n- {col_name} ({col_type}) {is_pk} {is_fk}"
+        
+        if sample_data and len(sample_data) > 0:
+            prompt += f"\n\nMUESTRA DE DATOS:\n"
+            for i, record in enumerate(sample_data[:3], 1):
+                prompt += f"\nRegistro {i}:\n"
+                for key, value in record.items():
+                    value_str = str(value)[:50]
+                    if len(str(value)) > 50:
+                        value_str += "..."
+                    prompt += f"  {key}: {value_str}\n"
+        
+        prompt += f"""
+
+TAREA:
+Determina los campos MÁS IMPORTANTES para incluir en un contexto conversacional.
+
+CRITERIOS:
+1. Campos que identifican registros únicos
+2. Campos descriptivos que ayudan a entender el registro
+3. Campos que probablemente se mencionen en conversaciones
+4. Campos con información de negocio relevante
+5. Foreign Keys importantes para relaciones
+
+EVITA:
+- Campos de auditoría técnica
+- Campos con valores muy largos
+- Campos que rara vez se mencionan
+
+REGLAS DE CANTIDAD:
+- Si la tabla tiene ≤10 campos: selecciona hasta 5
+- Si la tabla tiene 11-20 campos: selecciona hasta 6-7
+- Si la tabla tiene 21-30 campos: selecciona hasta 7-8
+- Si la tabla tiene 31-40 campos: selecciona hasta 8-9
+- Si la tabla tiene >40 campos: selecciona hasta 10
+
+Responde SOLO con JSON:
+{{
+  "essential_fields": ["campo1", "campo2", ...],
+  "reasoning": "breve explicación",
+  "recommended_count": <número>
+}}
+"""
+        return prompt
+    
+    def _validate_and_structure_analysis(
+        self,
+        table_name: str,
+        analysis: Dict[str, Any],
+        total_fields: int
+    ) -> Dict[str, Any]:
+        """Valida y estructura el análisis del LLM"""
+        essential_fields = analysis.get("essential_fields", [])
+        
+        schema = self.db.get_table_schema(table_name)
+        valid_fields = [col["name"] for col in schema.get("columns", [])]
+        
+        essential_fields = [f for f in essential_fields if f in valid_fields]
+        
+        max_fields = min(10, max(5, total_fields // 5))
+        essential_fields = essential_fields[:max_fields]
+        
+        return {
+            "table_name": table_name,
+            "total_fields": total_fields,
+            "essential_fields": essential_fields,
+            "essential_count": len(essential_fields),
+            "reasoning": analysis.get("reasoning", ""),
+            "analyzed_at": time.time()
+        }
+    
+    def _empty_analysis(self, table_name: str) -> Dict[str, Any]:
+        """Retorna análisis vacío en caso de error"""
+        return {
+            "table_name": table_name,
+            "total_fields": 0,
+            "essential_fields": [],
+            "essential_count": 0,
+            "reasoning": "Error en análisis"
+        }
+    
+    async def get_essential_fields_for_query(
+        self,
+        table_name: str,
+        user_query: str
+    ) -> List[str]:
+        """Obtiene campos esenciales ajustados según la query"""
+        base_analysis = await self.analyze_table_importance(table_name)
+        essential_base = base_analysis.get("essential_fields", [])
+        
+        if not essential_base:
+            return []
+        
+        # Para queries simples, retornar campos base
+        if len(user_query.split()) < 5:
+            return essential_base
+        
+        # Para queries complejas, ajustar con LLM
+        try:
+            schema = self.db.get_table_schema(table_name)
+            all_fields = [col["name"] for col in schema.get("columns", [])]
+            
+            prompt = f"""Query del usuario: "{user_query}"
+
+Campos base: {json.dumps(essential_base, indent=2)}
+Todos los campos: {json.dumps(all_fields, indent=2)}
+
+¿Qué campos son necesarios para esta query específica?
+
+Responde SOLO con JSON:
+{{
+  "fields_to_include": ["campo1", "campo2", ...],
+  "reasoning": "explicación breve"
+}}
+"""
+            
+            response = self.client.chat.completions.create(
+                model=settings.OPENAI_MODEL,
+                messages=[
+                    {"role": "system", "content": "Eres un experto en optimizar contexto de bases de datos."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.1,
+                response_format={"type": "json_object"}
+            )
+            
+            result = json.loads(response.choices[0].message.content)
+            adjusted_fields = result.get("fields_to_include", essential_base)
+            
+            adjusted_fields = [f for f in adjusted_fields if f in all_fields]
+            adjusted_fields = adjusted_fields[:10]
+            
+            logger.info(
+                "fields_adjusted_for_query",
+                table=table_name,
+                adjusted_count=len(adjusted_fields)
+            )
+            
+            return adjusted_fields
+            
+        except Exception as e:
+            logger.error("field_adjustment_error", error=str(e))
+            return essential_base
+    
+    def clear_cache(self, table_name: Optional[str] = None):
+        """Limpia cache de análisis"""
+        if table_name:
+            cache_key = f"importance_{table_name}"
+            if cache_key in self.analysis_cache:
+                del self.analysis_cache[cache_key]
+        else:
+            self.analysis_cache.clear()
+
+
+# Instancia global
+schema_intelligence = SchemaIntelligenceAgent()
+
 
 
 class DatabaseTools:

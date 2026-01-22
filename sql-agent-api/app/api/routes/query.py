@@ -3,6 +3,7 @@ Endpoints para queries en lenguaje natural
 """
 from fastapi import APIRouter, HTTPException
 from app.schemas.query import QueryRequest, QueryResponse, ErrorResponse
+from typing import Dict, Any, List, Optional  
 from app.agents.explorer_agent import explorer_agent
 from app.agents.learning_agent import learning_agent
 from app.api.routes.clarification import clarification_sessions
@@ -19,6 +20,179 @@ router = APIRouter()
 # Almacenamiento de contexto conversacional
 conversation_contexts = {}  # {conversation_id: {"queries": [], "results": [], "timestamp": datetime}}
 
+async def _build_intelligent_context(
+    ctx: Dict[str, Any],
+    new_query: str,
+    max_interactions: int = 3,
+    max_records: int = 3
+) -> str:
+    """
+    Construye contexto conversacional INTELIGENTE
+    Filtra campos irrelevantes automáticamente
+    """
+    context_hint = "\n\n[CONTEXTO DE CONVERSACIÓN ANTERIOR]:\n"
+    context_hint += "IMPORTANTE: Usa SOLO campos relevantes para la nueva pregunta.\n\n"
+    
+    recent_interactions = list(zip(
+        ctx["queries"][-max_interactions:],
+        ctx["results"][-max_interactions:]
+    ))
+    
+    for i, (prev_query, prev_result) in enumerate(recent_interactions, 1):
+        context_hint += f"\n--- Interacción {i} ---"
+        context_hint += f"\nPregunta: {prev_query}"
+        context_hint += f"\nRespuesta: {prev_result['answer'][:200]}"
+        
+        if prev_result.get('tables'):
+            context_hint += f"\nTablas: {', '.join(prev_result['tables'])}"
+        
+        if prev_result.get('sql'):
+            context_hint += f"\nSQL: {prev_result['sql'][:150]}..."
+        
+        # Datos con formato inteligente
+        data_summary = prev_result.get('data')
+        
+        if data_summary:
+            if isinstance(data_summary, dict):
+                context_hint += await _format_summary_for_context(
+                    summary=data_summary,
+                    max_records=max_records
+                )
+            elif isinstance(data_summary, list) and len(data_summary) > 0:
+                # Legacy: lista directa de datos
+                context_hint += f"\n[LEGACY: {len(data_summary)} registros]"
+        
+        context_hint += "\n"
+    
+    context_hint += "\n[NUEVA PREGUNTA]:\n"
+    
+    return context_hint
+
+
+async def _format_summary_for_context(
+    summary: Dict[str, Any],
+    max_records: int = 3
+) -> str:
+    """Formatea un resumen para el contexto"""
+    context = ""
+    
+    summary_type = summary.get("type", "unknown")
+    row_count = summary.get("row_count", 0)
+    data = summary.get("data", [])
+    field_info = summary.get("field_info", {})
+    
+    if summary_type == "aggregation":
+        context += f"\nDatos agregados ({row_count} grupos):"
+        for idx, record in enumerate(data[:max_records], 1):
+            context += f"\n  {idx}. {record}"
+        
+        if len(data) > max_records:
+            context += f"\n  ... +{len(data) - max_records} grupos más"
+    
+    else:
+        total_fields = field_info.get("total_fields", 0)
+        essential = field_info.get("essential_fields", [])
+        omitted = field_info.get("omitted_count", 0)
+        
+        context += f"\nDatos ({row_count} registros"
+        if total_fields:
+            context += f", {total_fields} campos totales"
+        if essential:
+            context += f", mostrando {len(essential)} esenciales"
+        context += "):"
+        
+        for idx, record in enumerate(data[:max_records], 1):
+            context += f"\n  {idx}. {record}"
+        
+        if len(data) > max_records:
+            context += f"\n  ... +{len(data) - max_records} más"
+        
+        if omitted and omitted > 0:
+            context += f"\n  [Omitidos: {omitted} campos]"
+    
+    if summary.get("stats"):
+        context += f"\n  Stats: {summary['stats']}"
+    
+    return context
+
+
+async def _create_intelligent_summary(
+    data: List[Dict[str, Any]],
+    sql: Optional[str],
+    tables: Optional[List[str]],
+    user_query: str
+) -> Dict[str, Any]:
+    """Crea resumen INTELIGENTE usando SchemaIntelligenceAgent"""
+    if not data:
+        return None
+    
+    from app.tools.database_tools import schema_intelligence
+    
+    first_record = data[0]
+    all_fields = list(first_record.keys())
+    total_fields = len(all_fields)
+    
+    summary = {
+        "row_count": len(data),
+        "tables": tables or [],
+        "query_type": _detect_query_type_simple(sql) if sql else "unknown",
+        "field_info": {"total_fields": total_fields}
+    }
+    
+    # Detectar agregación
+    is_aggregation = sum(
+        1 for field in all_fields
+        if any(agg in field.lower() for agg in ['sum', 'count', 'avg', 'min', 'max', 'total'])
+    ) >= 2
+    
+    if is_aggregation:
+        summary["type"] = "aggregation"
+        summary["data"] = data[:10]
+        summary["field_info"]["all_fields"] = all_fields
+    
+    else:
+        summary["type"] = "listing"
+        
+        # Agente decide campos
+        essential_fields = []
+        if tables and len(tables) > 0:
+            try:
+                essential_fields = await schema_intelligence.get_essential_fields_for_query(
+                    table_name=tables[0],
+                    user_query=user_query
+                )
+                essential_fields = [f for f in essential_fields if f in all_fields]
+            except Exception as e:
+                logger.error("essential_fields_error", error=str(e))
+        
+        # Fallback
+        if not essential_fields:
+            essential_fields = [f for f in all_fields if 'id' in f.lower()][:5]
+            if not essential_fields:
+                essential_fields = all_fields[:5]
+        
+        # Guardar solo campos esenciales
+        summary["data"] = [
+            {k: v for k, v in record.items() if k in essential_fields}
+            for record in data[:5]
+        ]
+        
+        summary["field_info"]["essential_fields"] = essential_fields
+        summary["field_info"]["omitted_count"] = total_fields - len(essential_fields)
+    
+    return summary
+
+
+def _detect_query_type_simple(sql: str) -> str:
+    """Detecta tipo de query del SQL"""
+    sql_upper = sql.upper()
+    
+    if 'GROUP BY' in sql_upper:
+        return "aggregation"
+    elif 'ORDER BY' in sql_upper:
+        return "ranking"
+    else:
+        return "listing"
 
 @router.post("/query", response_model=QueryResponse)
 async def execute_query(request: QueryRequest):
@@ -46,47 +220,26 @@ async def execute_query(request: QueryRequest):
         context_used = False
         
         if request.conversation_id and request.conversation_id in conversation_contexts:
-            ctx = conversation_contexts[request.conversation_id]
-            
-            if ctx["queries"]:
-                context_used = True
-                context_hint = "\n\n[CONTEXTO DE CONVERSACIÓN ANTERIOR - USA ESTO PARA ENTENDER REFERENCIAS]:\n"
+                ctx = conversation_contexts[request.conversation_id]
                 
-                # Incluir últimas 3 interacciones
-                recent_interactions = list(zip(ctx["queries"][-3:], ctx["results"][-3:]))
-                
-                for i, (prev_query, prev_result) in enumerate(recent_interactions, 1):
-                    context_hint += f"\n--- Interacción {i} ---"
-                    context_hint += f"\nUsuario preguntó: {prev_query}"
-                    context_hint += f"\nTú respondiste: {prev_result['answer'][:300]}"
+                if ctx["queries"]:
+                    context_used = True
                     
-                    if prev_result.get('tables'):
-                        context_hint += f"\nUsaste las tablas: {', '.join(prev_result['tables'])}"
+                    # 🔥 NUEVO: Usar context builder inteligente
+                    context_hint = await _build_intelligent_context(
+                        ctx=ctx,
+                        new_query=request.query,
+                        max_interactions=3,
+                        max_records=3
+                    )
                     
-                    if prev_result.get('sql'):
-                        context_hint += f"\nSQL ejecutado: {prev_result['sql'][:200]}"
+                    enhanced_query = context_hint + request.query
                     
-                    # MEJORADO: Incluir DATOS COMPLETOS si hay
-                    if prev_result.get('data') and len(prev_result['data']) > 0:
-                        context_hint += f"\n\nDATOS RETORNADOS ({len(prev_result['data'])} registros):"
-                        
-                        # Mostrar hasta 10 registros completos
-                        for idx, record in enumerate(prev_result['data'][:10], 1):
-                            context_hint += f"\n  Registro {idx}: {record}"
-                        
-                        if len(prev_result['data']) > 10:
-                            context_hint += f"\n  ... y {len(prev_result['data']) - 10} registros más"
-                    
-                    context_hint += "\n"
-                
-                context_hint += "\n\n[NUEVA PREGUNTA DEL USUARIO - puede referirse al contexto anterior]:\n"
-                enhanced_query = context_hint + request.query
-                
-                logger.info(
-                    "using_conversation_context",
-                    conversation_id=request.conversation_id,
-                    previous_queries=len(ctx["queries"])
-                )
+                    logger.info(
+                        "using_intelligent_context",
+                        conversation_id=request.conversation_id,
+                        context_size=len(context_hint)
+                    )
         
         # Ejecutar exploración con el agente
         result = await explorer_agent.explore_and_answer(
@@ -211,6 +364,7 @@ async def execute_query(request: QueryRequest):
         )
         
         # IMPORTANTE: Guardar en contexto conversacional
+        # IMPORTANTE: Guardar en contexto conversacional
         if request.conversation_id:
             if request.conversation_id not in conversation_contexts:
                 conversation_contexts[request.conversation_id] = {
@@ -219,16 +373,24 @@ async def execute_query(request: QueryRequest):
                     "timestamp": time.time()
                 }
             
+            # 🔥 NUEVO: Crear resumen inteligente
+            data_summary = await _create_intelligent_summary(
+                data=data,
+                sql=sql_generated,
+                tables=tables_used,
+                user_query=request.query
+            ) if data else None
+            
             # Agregar query y resultado al historial
             conversation_contexts[request.conversation_id]["queries"].append(request.query)
             conversation_contexts[request.conversation_id]["results"].append({
                 "answer": answer,
                 "sql": sql_generated,
-                "data": data[:20] if data else None,  # Solo primeros 10 registros
+                "data": data_summary,  # 🔥 Solo resumen, NO datos completos
                 "tables": tables_used
             })
             
-            # Mantener solo últimas 5 interacciones (para no sobrecargar)
+            # Mantener solo últimas 5 interacciones
             if len(conversation_contexts[request.conversation_id]["queries"]) > 5:
                 conversation_contexts[request.conversation_id]["queries"].pop(0)
                 conversation_contexts[request.conversation_id]["results"].pop(0)
@@ -237,9 +399,9 @@ async def execute_query(request: QueryRequest):
             conversation_contexts[request.conversation_id]["timestamp"] = time.time()
             
             logger.info(
-                "conversation_context_saved",
+                "context_saved_intelligently",
                 conversation_id=request.conversation_id,
-                total_interactions=len(conversation_contexts[request.conversation_id]["queries"])
+                summary_type=data_summary.get("type") if data_summary else None
             )
         
         logger.info(

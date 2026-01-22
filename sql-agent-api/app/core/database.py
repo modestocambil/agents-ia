@@ -224,28 +224,33 @@ class DatabaseManager:
             logger.error("fks_error", table=table_name, error=str(e))
             raise
     
-    def get_sample_data(
-        self, 
-        table_name: str, 
-        limit: int = 5
-    ) -> List[Dict[str, Any]]:
+    def get_sample_data(self, table_name: str, limit: int = 5) -> List[Dict]:
         """
-        Obtiene datos de ejemplo de una tabla
+        Obtiene datos de muestra de una tabla
         
         Args:
             table_name: Nombre de la tabla
-            limit: Número de filas a obtener
+            limit: Cantidad de registros
             
         Returns:
-            Lista de diccionarios con datos de ejemplo
+            Lista de diccionarios con los datos
         """
         try:
-            query = f"SELECT * FROM {table_name} LIMIT {limit}"
-            return self.execute_query(query, limit=limit)
+            from sqlalchemy import text
             
+            query = f"SELECT * FROM {table_name} LIMIT {limit}"
+            
+            with self.engine.connect() as conn:
+                result = conn.execute(text(query))
+                columns = result.keys()
+                rows = result.fetchall()
+                
+                return [dict(zip(columns, row)) for row in rows]
+                
         except Exception as e:
-            logger.error("sample_data_error", table=table_name, error=str(e))
-            raise
+            logger.error("get_sample_data_error", table=table_name, error=str(e))
+            return []
+
     
     def get_table_row_count(self, table_name: str) -> int:
         """
